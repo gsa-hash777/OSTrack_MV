@@ -224,6 +224,57 @@ def map_box_to_crop_torch(gt_xywh: torch.Tensor, prev_state_xywh: torch.Tensor, 
 def feature_delta_loss(updated_feat: torch.Tensor, original_feat: torch.Tensor):
     return (updated_feat - original_feat).pow(2).mean()
 
+def cxcywh_to_xyxy(box: torch.Tensor) -> torch.Tensor:
+    cx, cy, w, h = box.unbind(-1)
+    x1 = cx - 0.5 * w
+    y1 = cy - 0.5 * h
+    x2 = cx + 0.5 * w
+    y2 = cy + 0.5 * h
+    return torch.stack([x1, y1, x2, y2], dim=-1)
+
+def generalized_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """
+    Compute GIoU between boxes in xyxy format.
+    boxes1, boxes2: (..., 4)
+    Returns GIoU with shape (...,)
+    """
+    x1 = torch.max(boxes1[..., 0], boxes2[..., 0])
+    y1 = torch.max(boxes1[..., 1], boxes2[..., 1])
+    x2 = torch.min(boxes1[..., 2], boxes2[..., 2])
+    y2 = torch.min(boxes1[..., 3], boxes2[..., 3])
+
+    inter_w = (x2 - x1).clamp(min=0)
+    inter_h = (y2 - y1).clamp(min=0)
+    inter = inter_w * inter_h
+
+    area1 = (boxes1[..., 2] - boxes1[..., 0]).clamp(min=0) * (boxes1[..., 3] - boxes1[..., 1]).clamp(min=0)
+    area2 = (boxes2[..., 2] - boxes2[..., 0]).clamp(min=0) * (boxes2[..., 3] - boxes2[..., 1]).clamp(min=0)
+    union = area1 + area2 - inter
+    iou = inter / (union + 1e-6)
+
+    enc_x1 = torch.min(boxes1[..., 0], boxes2[..., 0])
+    enc_y1 = torch.min(boxes1[..., 1], boxes2[..., 1])
+    enc_x2 = torch.max(boxes1[..., 2], boxes2[..., 2])
+    enc_y2 = torch.max(boxes1[..., 3], boxes2[..., 3])
+    enc_area = (enc_x2 - enc_x1).clamp(min=0) * (enc_y2 - enc_y1).clamp(min=0)
+
+    giou = iou - (enc_area - union) / (enc_area + 1e-6)
+    return giou
+
+def calibrated_teacher_conf(score_conf: float, prev_state: List[float], curr_state: List[float]) -> float:
+    """
+    Combine raw score with motion smoothness (lower motion => higher reliability).
+    """
+    px, py, pw, ph = prev_state
+    cx, cy, cw, ch = curr_state
+    prev_cx = px + 0.5 * pw
+    prev_cy = py + 0.5 * ph
+    curr_cx = cx + 0.5 * cw
+    curr_cy = cy + 0.5 * ch
+    dist = ((curr_cx - prev_cx) ** 2 + (curr_cy - prev_cy) ** 2) ** 0.5
+    scale = max((pw * ph) ** 0.5, 1.0)
+    motion_penalty = float(torch.exp(torch.tensor(-dist / (scale + 1e-6))).item())
+    return 0.5 * score_conf + 0.5 * motion_penalty
 
 # -----------------------------
 # 4) 数据读取：按md目录->多视角img/ + groundtruth.txt
@@ -286,9 +337,13 @@ def train_one_md(
     temperature: float = 0.7,
     top_k=None,
     w_l1: float = 1.0,
+    w_giou: float = 1.0,
     w_delta: float = 0.05,
     w_gate: float = 0.10,                # gate 约束权重
     min_gate_good: float = 0.30,         # 好老师时 gate 至少这么大
+    w_gate_bad: float = 0.05,            # 坏老师 gate 抑制权重
+    max_gate_bad: float = 0.10,          # 坏老师时 gate 至多这么大
+    soft_tau: float = 0.15,              # 软样本权重温度
     max_frames=None,
     seed: int = 0,
     verbose: bool = False,
@@ -298,8 +353,8 @@ def train_one_md(
     """
     两视角专用训练：
       - 只训练 fusion_net
-      - 仅在 (ci < T_low && cj >= T_high) 时，对 i 进行融合与 box loss
-      - 若 ci < T_low 但 cj < T_high：跳过该帧（不融合不训练）——与你推理一致
+      - low-high 为强样本；low-mid 为软样本（loss 按权重缩放）
+      - 若低视角且另一视角也很低：跳过该帧（不融合不训练）
     """
     import os, random, cv2, torch
     from concurrent.futures import ThreadPoolExecutor
@@ -355,6 +410,8 @@ def train_one_md(
     for v, trk in enumerate(trackers):
         trk.initialize(first_frames_rgb[v], {"init_bbox": optional_boxes[v]})
 
+    prev_states = [list(trk.state) for trk in trackers]
+
     # ---------- prefetch ----------
     pool = ThreadPoolExecutor(max_workers=prefetch_workers)
 
@@ -387,6 +444,7 @@ def train_one_md(
         # (1) track：no_grad 取 features/conf
         # ============================================================
         with torch.no_grad():
+            prev_states = [list(trk.state) for trk in trackers]
             out0 = trackers[0].track(frames_rgb_list[0])
             out1 = trackers[1].track(frames_rgb_list[1])
 
@@ -396,8 +454,10 @@ def train_one_md(
             if (sm0 is None) or (sm1 is None) or (f0 is None) or (f1 is None):
                 continue
 
-            c0 = float(sm0.max().item())
-            c1 = float(sm1.max().item())
+            raw_c0 = float(sm0.max().item())
+            raw_c1 = float(sm1.max().item())
+            c0 = calibrated_teacher_conf(raw_c0, prev_states[0], trackers[0].state)
+            c1 = calibrated_teacher_conf(raw_c1, prev_states[1], trackers[1].state)
 
             features = [f0.to(device), f1.to(device)]
             confidences = [c0, c1]
@@ -406,12 +466,19 @@ def train_one_md(
         need0 = (c0 < T_low)
         need1 = (c1 < T_low)
 
-        # 只在 low-high 情况训练（与你推理一致）
+        def soft_weight(student_conf: float, teacher_conf: float, tau: float) -> float:
+            return float(torch.sigmoid(torch.tensor((teacher_conf - student_conf) / max(tau, 1e-6))).item())
+
+        # low-high 为强样本，low-mid 为软样本
         train_pairs = []
-        if need0 and (c1 >= T_high):
-            train_pairs.append((0, 1))
-        if need1 and (c0 >= T_high):
-            train_pairs.append((1, 0))
+        if c0 < T_low and c1 >= T_high:
+            train_pairs.append((0, 1, 1.0))
+        elif c0 < T_high and c1 >= T_low:
+            train_pairs.append((0, 1, soft_weight(c0, c1, soft_tau)))
+        if c1 < T_low and c0 >= T_high:
+            train_pairs.append((1, 0, 1.0))
+        elif c1 < T_high and c0 >= T_low:
+            train_pairs.append((1, 0, soft_weight(c1, c0, soft_tau)))
 
         if len(train_pairs) == 0:
             # 你提出的规则：另一视角 < 0.5 就跳过这帧不融合
@@ -428,7 +495,7 @@ def train_one_md(
             used = 0
 
             with torch.cuda.amp.autocast(enabled=device.startswith("cuda")):
-                for (i, j) in train_pairs:
+                for (i, j, pair_weight) in train_pairs:
                     # i: 低于T_low 需要救援
                     # j: >=T_high 可靠老师
 
@@ -463,12 +530,27 @@ def train_one_md(
                     )
 
                     loss_l1 = torch.abs(pred_box_crop - gt_box_crop).mean()
+                    giou = generalized_iou(
+                        cxcywh_to_xyxy(pred_box_crop),
+                        cxcywh_to_xyxy(gt_box_crop)
+                    )
+                    loss_giou = (1.0 - giou).mean()
                     loss_reg = feature_delta_loss(updated_feat, features[i])
 
                     # 好老师时 gate 不要太小，否则融合不起作用
                     loss_gate = torch.relu(min_gate_good - gate_i).mean()
+                    # 坏老师时 gate 不要太大
+                    loss_gate_bad = torch.relu(gate_i - max_gate_bad).mean()
 
-                    loss = w_l1 * loss_l1 + w_delta * loss_reg + w_gate * loss_gate
+                    loss = (
+                        w_l1 * loss_l1
+                        + w_giou * loss_giou
+                        + w_delta * loss_reg
+                        + w_gate * loss_gate
+                    )
+                    if confidences[j] < T_high:
+                        loss = loss + w_gate_bad * loss_gate_bad
+                    loss = loss * pair_weight
                     loss_sum = loss if (loss_sum is None) else (loss_sum + loss)
                     used += 1
 
@@ -520,6 +602,12 @@ def main():
                         help="Weight for gate regularization loss")
     parser.add_argument("--min_gate_good", type=float, default=0.30,
                         help="In good-teacher case, encourage gate >= this value")
+    parser.add_argument("--w_gate_bad", type=float, default=0.05,
+                        help="Weight for bad-teacher gate suppression")
+    parser.add_argument("--max_gate_bad", type=float, default=0.10,
+                        help="In bad-teacher case, encourage gate <= this value")
+    parser.add_argument("--soft_tau", type=float, default=0.15,
+                        help="Temperature for soft sample weighting")
 
     parser.add_argument("--prefetch_workers", type=int, default=4,
                         help="Number of threads for image prefetching")
@@ -528,6 +616,7 @@ def main():
     parser.add_argument("--top_k", type=int, default=50)
 
     parser.add_argument("--w_l1", type=float, default=1.0)
+    parser.add_argument("--w_giou", type=float, default=1.0)
     parser.add_argument("--w_delta", type=float, default=0.05)
 
     parser.add_argument("--max_mds", type=int, default=-1)
@@ -577,10 +666,14 @@ def main():
                 top_k=(args.top_k if args.top_k > 0 else None),
                 # loss 权重
                 w_l1=args.w_l1,
+                w_giou=args.w_giou,
                 w_delta=args.w_delta,
                 # gate 约束（推荐显式传入，方便你调参）
                 w_gate=args.w_gate,
                 min_gate_good=args.min_gate_good,
+                w_gate_bad=args.w_gate_bad,
+                max_gate_bad=args.max_gate_bad,
+                soft_tau=args.soft_tau,
 
                 max_frames=(args.max_frames if args.max_frames > 0 else None),
                 seed=args.seed + ep,
